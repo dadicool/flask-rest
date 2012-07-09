@@ -1,18 +1,24 @@
 import json
-from flask import request
+from flask import request, Response
 import werkzeug
+
 
 class RESTResource(object):
     """Represents a REST resource, with the different HTTP verbs"""
-    _NEED_ID = ["get", "update", "delete"]
+    _NEED_ID = ["put", "delete"]
     _VERBS = {"get": "GET",
+              "list": "GET",
+              "put": "PUT",
               "update": "PUT",
               "delete": "DELETE",
-              "list": "GET",
-              "add": "POST",}
+              "add": "POST",
+              "post": "POST",
+              "head": "HEAD",
+              "options": "OPTIONS",
+              }
 
     def __init__(self, name, route, app, handler, authentifier=None,
-            actions=None, inject_name=None):
+            actions=None, inject_name=None, identifer=None):
         """
         :name:
             name of the resource. This is being used when registering
@@ -20,13 +26,15 @@ class RESTResource(object):
             that will be passed to the views
 
         :route:
-           Default route for this resource
+           Default route for this resource.  If none are given, will
+           iterate over all of the methods within the handler and
+           add a url rule for each method.
 
         :app:
             Application to register the routes onto
 
         :actions:
-            Authorized actions. Optional. None means all.
+            Authorized actions. Optional. None means all the actions defined in the class.
 
         :handler:
             The handler instance which will handle the requests
@@ -34,6 +42,10 @@ class RESTResource(object):
         :authentifier:
             callable checking the authentication. If specified, all the
             methods will be checked against it.
+
+        :identifier:
+            Name of key/id used to identifier specific items in all requests
+            that require specific item
         """
         if not actions:
             actions = self._VERBS.keys()
@@ -42,8 +54,10 @@ class RESTResource(object):
         self._handler = handler
         self._name = name
         self._identifier = "%s_id" % name
+        if (identifer != None):
+            self._identifier = identifer
         self._authentifier = authentifier
-        self._inject_name = inject_name # FIXME
+        self._inject_name = inject_name  # FIXME
 
         for action in actions:
             self.add_url_rule(app, action)
@@ -67,22 +81,23 @@ class RESTResource(object):
         """Registers a new url to the given application, regarding
         the action.
         """
-        method = getattr(self._handler, action)
+        method = getattr(self._handler, action, None)
+        if (method != None):
+            # decorate the view
+            if self._authentifier:
+                method = need_auth(self._authentifier,
+                        self._identifier)(method)
 
-        # decorate the view
-        if self._authentifier:
-            method = need_auth(self._authentifier,
-                    self._inject_name or self._name)(method)
+            method = serialize(method)
 
-        method = serialize(method)
-
-        app.add_url_rule(
-            self._get_route_for(action),
-            "%s_%s" % (self._name, action),
-            method,
-            methods=[self._VERBS.get(action, "GET")])
+            app.add_url_rule(
+                self._get_route_for(action),
+                "%s_%s" % (self._name, action),
+                method,
+                methods=[self._VERBS.get(action, "GET")])
 
 
+# decorators
 def need_auth(authentifier, name=None, remove_attr=True):
     """Decorator checking that the authentifier does not returns false in
     the current context.
@@ -110,16 +125,18 @@ def need_auth(authentifier, name=None, remove_attr=True):
             if result:
                 if name:
                     kwargs[name] = result
-                if remove_attr:
-                    del kwargs["%s_id" % name]
+                if remove_attr and name in kwargs:
+                    del kwargs["%s" % name]
                 return func(*args, **kwargs)
             else:
-                return 401, "Unauthorized"
+                return werkzeug.Response("Could not verify your access level for that URL.\n"
+                        "You have to login with proper credentials", 401,
+                        {'WWW-Authenticate': 'Basic realm="Login Required"'})
         return wrapped
     return wrapper
 
-# serializers
 
+# serializers
 def serialize(func):
     """If the object returned by the view is not already a Response, serialize
     it using the ACCEPT header and return it.
@@ -131,7 +148,10 @@ def serialize(func):
         serializer = SERIALIZERS[mime]
 
         status = 200
-        if len(data) == 2:
+        if (type(data) == werkzeug.Response or
+            type(data) == Response):
+            return data
+        elif (type(tuple)):
             status, data = data
 
         # serialize it
